@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "buildCommand": "pnpm install && pnpm run build",
+  "buildCommand": "pnpm install terser && pnpm run build",
   "installCommand": "npm i -g pnpm && pnpm install",
   "outputDirectory": "dist",
   "framework": "vite",
