@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import { supabase, vehicles, timeLogs } from '../../services/supabase';
 import useAuthStore from '../../store/authStore';
 import Button from '../../components/common/Button';
@@ -14,6 +14,7 @@ const PunchIn = () => {
   const [isPunching, setIsPunching] = useState(false);
   const [error, setError] = useState(null);
   const [agreement, setAgreement] = useState(null);
+  const [inspection, setInspection] = useState(null);
   const [currentDateTime, setCurrentDateTime] = useState(new Date());
 
   // Update current time every second
@@ -25,7 +26,7 @@ const PunchIn = () => {
     return () => clearInterval(timer);
   }, []);
 
-  // Fetch vehicle and agreement data
+  // Fetch vehicle, agreement, and inspection data
   useEffect(() => {
     const fetchData = async () => {
       if (!vehicleId || !user) return;
@@ -61,6 +62,23 @@ const PunchIn = () => {
         }
         
         setAgreement(agreementData);
+        
+        // Check if there's an inspection record for this vehicle
+        const { data: inspectionData, error: inspectionError } = await supabase
+          .from('vehicle_inspections')
+          .select('*')
+          .eq('driver_id', user.id)
+          .eq('vehicle_id', vehicleId)
+          .eq('inspection_type', 'pre')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+          
+        if (inspectionError && inspectionError.code !== 'PGRST116') {
+          throw inspectionError;
+        }
+        
+        setInspection(inspectionData);
         
         // Check if driver already has an active time log
         const { data: activeLog, error: logError } = await timeLogs.getActiveForDriver(user.id);
@@ -146,18 +164,18 @@ const PunchIn = () => {
     );
   }
 
-  // If no agreement found, redirect to agreement page
-  if (!agreement) {
+  // If no agreement found or no inspection, redirect to agreement page
+  if (!agreement || !inspection) {
     return (
       <div className="text-center py-10">
         <div className="text-5xl mb-4">📋</div>
-        <h2 className="text-2xl font-bold mb-2">Agreement Required</h2>
-        <p className="text-gray-600 mb-4">You need to sign an agreement before punching in.</p>
+        <h2 className="text-2xl font-bold mb-2">Agreement and Photos Required</h2>
+        <p className="text-gray-600 mb-4">You need to sign an agreement and take inspection photos before punching in.</p>
         <Button
           variant="primary"
           onClick={() => navigate(`/driver/agreement/${vehicleId}`)}
         >
-          Sign Agreement
+          Complete Requirements
         </Button>
       </div>
     );
@@ -200,9 +218,18 @@ const PunchIn = () => {
               </div>
               
               <div className="flex justify-between">
-                <span className="text-gray-600">Video Check:</span>
-                <span className="font-medium text-success">Completed</span>
+                <span className="text-gray-600">Inspection Photos:</span>
+                <span className="font-medium text-success">Completed ({inspection.image_count})</span>
               </div>
+              
+              {inspection.pdf_url && (
+                <div className="flex justify-between mt-2">
+                  <span className="text-gray-600">Inspection Report:</span>
+                  <Link to={`/pdf/${inspection.pdf_url.split('/').pop()}`} className="text-primary hover:underline">
+                    View PDF
+                  </Link>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -228,7 +255,7 @@ const PunchIn = () => {
                 By punching in, you confirm that:
               </p>
               <ul className="list-disc pl-5 mt-2 space-y-1 text-sm text-gray-600">
-                <li>You have inspected the vehicle and recorded a video.</li>
+                <li>You have inspected the vehicle and taken photos.</li>
                 <li>The vehicle is in good working condition.</li>
                 <li>You will follow all traffic rules and safety guidelines.</li>
                 <li>You will report any issues or incidents immediately.</li>

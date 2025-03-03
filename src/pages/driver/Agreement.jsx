@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { supabase, vehicles } from '../../services/supabase';
+import { supabase, vehicles, storage } from '../../services/supabase';
 import useAuthStore from '../../store/authStore';
 import Button from '../../components/common/Button';
 import Loading from '../../components/common/Loading';
+import ImageCapture from '../../components/driver/ImageCapture';
 
 const Agreement = () => {
   const { vehicleId } = useParams();
@@ -13,15 +14,9 @@ const Agreement = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [agreementSigned, setAgreementSigned] = useState(false);
-  const [videoUploaded, setVideoUploaded] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingDone, setRecordingDone] = useState(false);
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [stream, setStream] = useState(null);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
-  const [recordedChunks, setRecordedChunks] = useState([]);
-  const videoRef = useRef(null);
+  const [imagesUploaded, setImagesUploaded] = useState(false);
+  const [uploadingImages, setUploadingImages] = useState(false);
+  const [driverInfo, setDriverInfo] = useState(null);  // Added state for full driver info
   const canvasRef = useRef(null);
   const signaturePadRef = useRef(null);
 
@@ -54,11 +49,39 @@ const Agreement = () => {
     fetchVehicle();
   }, [vehicleId]);
 
+  // Fetch driver's full information when component loads
+  useEffect(() => {
+    const fetchDriverInfo = async () => {
+      if (user && user.id) {
+        try {
+          const { data, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', user.id)
+            .single();
+            
+          if (error) throw error;
+          
+          if (data) {
+            setDriverInfo(data);
+          }
+        } catch (err) {
+          console.error('Error fetching driver details:', err);
+        }
+      }
+    };
+    
+    fetchDriverInfo();
+  }, [user]);
+
   // Generate agreement text
   const generateAgreementText = () => {
     if (!vehicle || !user) return '';
     
     const today = new Date().toLocaleDateString();
+    
+    // Use driverInfo's name if available, otherwise fallback to a default
+    const driverName = driverInfo?.name || 'Driver';
     
     return `VEHICLE USAGE AGREEMENT
 
@@ -66,7 +89,7 @@ Date: ${today}
 
 THIS AGREEMENT is made between:
 
-Driver: ${user.name || user.email}
+Driver: ${driverName}
 Vehicle: ${vehicle.make} ${vehicle.model} (Vehicle #${vehicle.vehicle_number})
 
 Terms and Conditions:
@@ -281,172 +304,84 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
     }
   };
 
-  // Convert blob to smaller size (compress)
-  const compressVideo = async (blob) => {
-    // For simplicity, this just checks if the blob is too large and warns the user
-    // A real compression would require a video processing library
-    const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+  // Handle image capture completion and upload
+  const handleImageCaptureComplete = async (imageData) => {
+    if (!vehicleId || !user) return;
     
-    if (blob.size > MAX_SIZE) {
-      console.warn(`Video size (${(blob.size / (1024 * 1024)).toFixed(2)}MB) exceeds 5MB limit. Attempting upload anyway.`);
-      // In a production app, you'd compress here
-    }
-    
-    return blob;
-  };
-
-  // Request camera access and start recording
-  const startVideoRecording = async () => {
     try {
-      // Clear any previous recording
-      setRecordedChunks([]);
-      setRecordingDone(false);
+      setUploadingImages(true);
       
-      // Request camera access
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          facingMode: 'environment',
-          width: { ideal: 640 },  // Reduce resolution for smaller file size
-          height: { ideal: 480 } 
-        }, 
-        audio: true 
+      // Create the folder name for this inspection
+      const folderName = `Agreement-${vehicleId}`;
+      const bucketName = 'vehicle_images';
+      
+      // Loop through each image and upload it
+      const uploadPromises = imageData.images.map(async (imageDataUrl, index) => {
+        try {
+          // Convert the data URL to a Blob
+          const response = await fetch(imageDataUrl);
+          const blob = await response.blob();
+          
+          // Prepare the file name
+          const imageFileName = `${folderName}/image-${index + 1}-${Date.now()}.jpg`;
+          
+          // Upload to Supabase storage
+          const { data, error } = await storage.uploadImage(bucketName, imageFileName, blob);
+          
+          if (error) {
+            console.error(`Error uploading image ${index + 1}:`, error);
+            throw error;
+          }
+          
+          return data;
+        } catch (err) {
+          console.error(`Error processing image ${index + 1}:`, err);
+          throw err;
+        }
       });
       
-      // Set video source
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        videoRef.current.play();
+      // Update progress during uploads
+      let completedUploads = 0;
+      const totalUploads = imageData.images.length;
+      
+      // Process uploads one by one to track progress
+      for (const uploadPromise of uploadPromises) {
+        await uploadPromise;
+        completedUploads++;
+        const progress = Math.round((completedUploads / totalUploads) * 100);
+        imageData.uploadProgress(progress);
       }
       
-      // Create media recorder with lower quality settings for smaller files
-      const options = { 
-        mimeType: 'video/webm;codecs=vp8,opus',
-        videoBitsPerSecond: 600000  // Lower bitrate for smaller file
-      };
-      
-      const recorder = new MediaRecorder(mediaStream, options);
-      setMediaRecorder(recorder);
-      setStream(mediaStream);
-      
-      const chunks = [];
-      
-      // Listen for data
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          chunks.push(e.data);
-        }
-      };
-      
-      // Handle recording complete
-      recorder.onstop = () => {
-        // Save the chunks for later processing
-        setRecordedChunks(chunks);
-        setRecordingDone(true);
-      };
-      
-      // Start recording
-      recorder.start(1000); // Collect data in 1-second chunks for better handling
-      setIsRecording(true);
-      
-      // Set time limit (15 seconds)
-      const timerId = setInterval(() => {
-        setRecordingTime((prev) => {
-          if (prev >= 15) {
-            clearInterval(timerId);
-            stopRecording();
-            return 15;
-          }
-          return prev + 1;
-        });
-      }, 1000);
-      
-    } catch (err) {
-      console.error('Error accessing camera:', err);
-      alert('Failed to access camera. Please check your device permissions.');
-    }
-  };
-
-  // Stop recording
-  const stopRecording = () => {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.stop();
-    }
-    
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop());
-    }
-    
-    setIsRecording(false);
-  };
-
-  // Handle save video button click
-  const handleSaveVideo = async () => {
-    if (recordedChunks.length === 0) {
-      alert('No recording available to save.');
-      return;
-    }
-    
-    try {
-      setUploadProgress(1);
-      
-      // Create a blob from the recorded chunks
-      const blob = new Blob(recordedChunks, { type: 'video/webm' });
-      
-      // Try to compress the video (if needed)
-      const compressedBlob = await compressVideo(blob);
-      
-      // Prepare the file name and path - store in the appropriate folder
-      const videoFileName = `Punch-In/vehicle-${vehicleId}-pre-${Date.now()}.webm`;
-      
-      // Upload to Supabase storage with progress tracking
-      const { error } = await supabase.storage
-        .from('videos')
-        .upload(videoFileName, compressedBlob, {
-          onUploadProgress: (progress) => {
-            const percentage = Math.round((progress.loaded / progress.total) * 100);
-            setUploadProgress(percentage);
-          }
-        });
-      
-      if (error) {
-        console.error('Storage upload error:', error);
-        throw error;
-      }
-      
-      // Get public URL
-      const { data: { publicUrl } } = supabase.storage
-        .from('videos')
-        .getPublicUrl(videoFileName);
-      
-      // Create video record
+      // Create a record of the inspection
       const { error: recordError } = await supabase
-        .from('videos')
+        .from('vehicle_inspections')
         .insert([{
           driver_id: user.id,
           vehicle_id: vehicleId,
-          type: 'pre',
-          video_url: publicUrl,
+          inspection_type: 'pre',
+          image_count: imageData.images.length,
+          images_folder: folderName,
+          timestamp: new Date().toISOString(),
         }]);
       
       if (recordError) throw recordError;
       
-      // Mark as uploaded and clear recorded chunks to free memory
-      setVideoUploaded(true);
-      setRecordedChunks([]);
-      setRecordingDone(false);
-      document.getElementById('videoModal').classList.add('hidden');
+      // Mark as uploaded
+      setImagesUploaded(true);
+      document.getElementById('imageModal').classList.add('hidden');
       
     } catch (err) {
       console.error('Error details:', err);
-      alert('Failed to upload video. Please try again.');
-      setUploadProgress(0);
+      alert('Failed to upload images. Please check your connection and try again.');
+    } finally {
+      setUploadingImages(false);
     }
   };
 
   // Proceed to next step
   const handleNext = async () => {
-    if (!agreementSigned || !videoUploaded) {
-      alert('Please sign the agreement and record a vehicle inspection video');
+    if (!agreementSigned || !imagesUploaded) {
+      alert('Please sign the agreement and take vehicle inspection images');
       return;
     }
     
@@ -531,15 +466,15 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
                 )}
               </div>
               
-              <div className={`flex-1 p-3 rounded-md ${videoUploaded ? 'bg-green-100 text-success' : 'bg-gray-100 text-gray-700'}`}>
+              <div className={`flex-1 p-3 rounded-md ${imagesUploaded ? 'bg-green-100 text-success' : 'bg-gray-100 text-gray-700'}`}>
                 <div className="flex items-center">
-                  <i className={`ri-video-line mr-2 ${videoUploaded ? 'text-success' : 'text-gray-500'}`}></i>
-                  <span className="font-medium">Video Check</span>
+                  <i className={`ri-camera-line mr-2 ${imagesUploaded ? 'text-success' : 'text-gray-500'}`}></i>
+                  <span className="font-medium">Photos</span>
                 </div>
-                {videoUploaded ? (
+                {imagesUploaded ? (
                   <span className="text-xs">Uploaded</span>
                 ) : (
-                  <span className="text-xs">Not uploaded</span>
+                  <span className="text-xs">Not taken</span>
                 )}
               </div>
             </div>
@@ -573,15 +508,15 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
               </Button>
             )}
             
-            {!videoUploaded ? (
+            {!imagesUploaded ? (
               <Button
                 isFullWidth
                 variant={agreementSigned ? 'primary' : 'outline'} 
                 disabled={!agreementSigned}
-                onClick={() => document.getElementById('videoModal').classList.remove('hidden')}
-                icon={<i className="ri-video-line"></i>}
+                onClick={() => document.getElementById('imageModal').classList.remove('hidden')}
+                icon={<i className="ri-camera-line"></i>}
               >
-                Record Vehicle Check Video
+                Take Vehicle Photos
               </Button>
             ) : (
               <Button
@@ -590,14 +525,14 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
                 disabled
                 icon={<i className="ri-check-line"></i>}
               >
-                Video Uploaded
+                Photos Uploaded
               </Button>
             )}
             
             <Button
               isFullWidth
-              variant={agreementSigned && videoUploaded ? 'success' : 'outline'}
-              disabled={!agreementSigned || !videoUploaded}
+              variant={agreementSigned && imagesUploaded ? 'success' : 'outline'}
+              disabled={!agreementSigned || !imagesUploaded}
               onClick={handleNext}
               icon={<i className="ri-arrow-right-line"></i>}
             >
@@ -669,14 +604,14 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
         </div>
       </div>
       
-      {/* Video Recording Modal */}
-      <div id="videoModal" className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 hidden">
+      {/* Image Capture Modal */}
+      <div id="imageModal" className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 hidden">
         <div className="bg-white rounded-lg shadow-xl w-full max-w-lg overflow-hidden">
           <div className="px-6 py-4 border-b flex justify-between items-center">
-            <h3 className="font-semibold text-lg">Record Vehicle Inspection</h3>
-            {!isRecording && !recordingDone && uploadProgress === 0 && !videoUploaded && (
+            <h3 className="font-semibold text-lg">Vehicle Inspection Photos</h3>
+            {!imagesUploaded && !uploadingImages && (
               <button 
-                onClick={() => document.getElementById('videoModal').classList.add('hidden')}
+                onClick={() => document.getElementById('imageModal').classList.add('hidden')}
                 className="text-gray-500 hover:text-gray-700"
               >
                 <i className="ri-close-line text-2xl"></i>
@@ -685,117 +620,12 @@ By signing below, the Driver acknowledges having read, understood, and agreed to
           </div>
           
           <div className="p-6">
-            {!videoUploaded ? (
-              <>
-                <div className="bg-black rounded-md overflow-hidden aspect-video mb-4">
-                  <video
-                    ref={videoRef}
-                    className="w-full h-full object-cover"
-                    autoPlay
-                    playsInline
-                    muted
-                  ></video>
-                </div>
-                
-                {isRecording ? (
-                  <div className="text-center mb-4">
-                    <div className="text-2xl font-bold text-red-600 mb-2">
-                      Recording... {recordingTime}/15s
-                    </div>
-                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-red-600 transition-all duration-1000"
-                        style={{ width: `${(recordingTime / 15) * 100}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ) : recordingDone ? (
-                  <div className="text-center mb-4">
-                    <div className="text-2xl font-bold text-green-600 mb-2">
-                      Recording Complete!
-                    </div>
-                    <p className="text-gray-600">Please save your video to continue.</p>
-                  </div>
-                ) : uploadProgress > 0 && uploadProgress < 100 ? (
-                  <div className="text-center mb-4">
-                    <div className="text-xl font-bold text-primary mb-2">
-                      Uploading... {uploadProgress}%
-                    </div>
-                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-primary transition-all duration-300"
-                        style={{ width: `${uploadProgress}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ) : uploadProgress === 100 ? (
-                  <div className="text-center mb-4">
-                    <div className="text-xl font-bold text-success mb-2">
-                      Upload Complete!
-                    </div>
-                    <p className="text-gray-600">Your video has been uploaded successfully.</p>
-                  </div>
-                ) : (
-                  <div className="text-center mb-4">
-                    <p className="text-gray-600 mb-2">
-                      Record a 15-second video showing the vehicle condition.
-                    </p>
-                    <p className="text-sm text-gray-500">
-                      Walk around the vehicle and capture any existing damage or issues.
-                    </p>
-                  </div>
-                )}
-                
-                <div className="flex justify-center">
-                  {!isRecording && !recordingDone && uploadProgress === 0 ? (
-                    <Button
-                      variant="primary"
-                      onClick={startVideoRecording}
-                      icon={<i className="ri-record-circle-line"></i>}
-                    >
-                      Start Recording
-                    </Button>
-                  ) : isRecording ? (
-                    <Button
-                      variant="danger"
-                      onClick={stopRecording}
-                      icon={<i className="ri-stop-circle-line"></i>}
-                    >
-                      Stop Recording
-                    </Button>
-                  ) : recordingDone ? (
-                    <Button
-                      variant="success"
-                      onClick={handleSaveVideo}
-                      icon={<i className="ri-save-line"></i>}
-                    >
-                      Click Save
-                    </Button>
-                  ) : uploadProgress > 0 && uploadProgress < 100 ? (
-                    <div className="text-center">
-                      <p className="text-sm text-gray-500 mb-2">Uploading video...</p>
-                    </div>
-                  ) : null}
-                </div>
-              </>
-            ) : (
-              <div className="text-center py-4">
-                <div className="text-5xl text-success mb-4">
-                  <i className="ri-check-line"></i>
-                </div>
-                <h4 className="text-xl font-bold text-gray-800 mb-2">Video Uploaded Successfully</h4>
-                <p className="text-gray-600">
-                  Your vehicle inspection video has been recorded and saved.
-                </p>
-                <Button
-                  variant="primary"
-                  className="mt-4"
-                  onClick={() => document.getElementById('videoModal').classList.add('hidden')}
-                >
-                  Close
-                </Button>
-              </div>
-            )}
+            <ImageCapture
+              maxImages={6}
+              title="Vehicle Inspection"
+              instructions="Take photos of the vehicle from different angles (front, sides, rear, interior) and any existing damage."
+              onCaptureComplete={handleImageCaptureComplete}
+            />
           </div>
         </div>
       </div>

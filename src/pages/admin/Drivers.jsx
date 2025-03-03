@@ -18,6 +18,7 @@ const Drivers = () => {
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
+  const [isActive, setIsActive] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Fetch drivers
@@ -34,6 +35,7 @@ const Drivers = () => {
             name,
             email,
             phone,
+            is_active,
             created_at,
             vehicles:vehicles(id, vehicle_number, make, model, status)
           `)
@@ -84,6 +86,7 @@ const Drivers = () => {
           email,
           phone,
           role: 'driver',
+          is_active: isActive,
         }]);
       
       if (dbError) throw dbError;
@@ -93,6 +96,7 @@ const Drivers = () => {
       setEmail('');
       setPhone('');
       setPassword('');
+      setIsActive(true);
       setIsAddModalOpen(false);
       
       // Show success message
@@ -107,6 +111,7 @@ const Drivers = () => {
           name,
           email,
           phone,
+          is_active,
           created_at,
           vehicles:vehicles(id, vehicle_number, make, model, status)
         `)
@@ -143,6 +148,7 @@ const Drivers = () => {
         .update({
           name,
           phone,
+          is_active: isActive,
         })
         .eq('id', selectedDriver.id);
       
@@ -153,6 +159,7 @@ const Drivers = () => {
       setEmail('');
       setPhone('');
       setPassword('');
+      setIsActive(true);
       setIsEditModalOpen(false);
       setSelectedDriver(null);
       
@@ -168,6 +175,7 @@ const Drivers = () => {
           name,
           email,
           phone,
+          is_active,
           created_at,
           vehicles:vehicles(id, vehicle_number, make, model, status)
         `)
@@ -180,6 +188,53 @@ const Drivers = () => {
       setError(err.message || 'Failed to update driver. Please try again.');
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  // Toggle driver active status
+  const handleToggleDriverStatus = async (driverId, currentStatus) => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      const newStatus = !currentStatus;
+      
+      // If deactivating a driver, check if they have active vehicles
+      if (!newStatus) {
+        const { data: activeVehicles } = await supabase
+          .from('vehicles')
+          .select('id')
+          .eq('assigned_driver_id', driverId)
+          .eq('status', 'in-use');
+        
+        if (activeVehicles && activeVehicles.length > 0) {
+          throw new Error('Cannot deactivate driver with active vehicles. Please reassign vehicles first.');
+        }
+      }
+      
+      // Update user status
+      const { error } = await supabase
+        .from('users')
+        .update({ is_active: newStatus })
+        .eq('id', driverId);
+      
+      if (error) throw error;
+      
+      // Show success message
+      setSuccess(`Driver ${newStatus ? 'activated' : 'deactivated'} successfully`);
+      setTimeout(() => setSuccess(null), 3000);
+      
+      // Update driver in local state
+      setDrivers(drivers.map(driver => 
+        driver.id === driverId 
+          ? { ...driver, is_active: newStatus } 
+          : driver
+      ));
+    } catch (err) {
+      console.error('Error toggling driver status:', err);
+      setError(err.message || 'Failed to update driver status. Please try again.');
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -235,6 +290,7 @@ const Drivers = () => {
     setName(driver.name);
     setEmail(driver.email);
     setPhone(driver.phone || '');
+    setIsActive(driver.is_active !== false); // Default to true if undefined
     setIsEditModalOpen(true);
   };
 
@@ -350,13 +406,25 @@ const Drivers = () => {
                         )}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                          assignedVehicle 
-                            ? 'bg-green-100 text-green-800' 
-                            : 'bg-gray-100 text-gray-800'
-                        }`}>
-                          {assignedVehicle ? 'Active' : 'Inactive'}
-                        </span>
+                        <div className="flex items-center">
+                          <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium mr-2 ${
+                            driver.is_active !== false 
+                              ? 'bg-green-100 text-green-800' 
+                              : 'bg-gray-100 text-gray-800'
+                          }`}>
+                            {driver.is_active !== false ? 'Active' : 'Inactive'}
+                          </span>
+                          <button 
+                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                              driver.is_active !== false ? 'bg-green-500' : 'bg-gray-200'
+                            }`}
+                            onClick={() => handleToggleDriverStatus(driver.id, driver.is_active !== false)}
+                          >
+                            <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                              driver.is_active !== false ? 'translate-x-5' : 'translate-x-0'
+                            }`}></span>
+                          </button>
+                        </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                         <button
@@ -461,6 +529,30 @@ const Drivers = () => {
                     The driver will use this password for their first login.
                   </p>
                 </div>
+                
+                <div className="mb-4">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="is-active" className="block text-sm font-medium text-gray-700">
+                      Status
+                    </label>
+                    <div className="flex items-center">
+                      <span className="mr-3 text-sm text-gray-500">
+                        {isActive ? 'Active' : 'Inactive'}
+                      </span>
+                      <button
+                        type="button"
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                          isActive ? 'bg-green-500' : 'bg-gray-200'
+                        }`}
+                        onClick={() => setIsActive(!isActive)}
+                      >
+                        <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          isActive ? 'translate-x-5' : 'translate-x-0'
+                        }`}></span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
               
               <div className="px-6 py-4 border-t flex justify-end space-x-3">
@@ -553,6 +645,35 @@ const Drivers = () => {
                     className="input"
                     required
                   />
+                </div>
+                
+                <div className="mb-4">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="edit-is-active" className="block text-sm font-medium text-gray-700">
+                      Status
+                    </label>
+                    <div className="flex items-center">
+                      <span className="mr-3 text-sm text-gray-500">
+                        {isActive ? 'Active' : 'Inactive'}
+                      </span>
+                      <button
+                        type="button"
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                          isActive ? 'bg-green-500' : 'bg-gray-200'
+                        }`}
+                        onClick={() => setIsActive(!isActive)}
+                      >
+                        <span className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                          isActive ? 'translate-x-5' : 'translate-x-0'
+                        }`}></span>
+                      </button>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-sm text-gray-500">
+                    {isActive ? 
+                      'Active drivers can log in and use the system.' : 
+                      'Inactive drivers cannot log in or be assigned to vehicles.'}
+                  </p>
                 </div>
                 
                 <div className="mb-4">

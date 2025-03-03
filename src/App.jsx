@@ -24,6 +24,9 @@ import Logs from './pages/admin/Logs';
 import AdminMaintenance from './pages/admin/Maintenance';
 import ApiKeys from './pages/admin/ApiKeys';
 
+// PDF Viewer
+import PdfViewer from './components/pdf/PdfViewer';
+
 function App() {
   const { checkAuthState, user, role, isLoading } = useAuthStore();
 
@@ -85,6 +88,9 @@ function App() {
           <Route path="api-keys" element={<ApiKeys />} />
           <Route index element={<Navigate to="dashboard" />} />
         </Route>
+        
+        {/* PDF Viewer Route */}
+        <Route path="/pdf/:pdfId" element={<PdfViewer />} />
         
         {/* Redirect root to login or appropriate dashboard */}
         <Route path="/" element={

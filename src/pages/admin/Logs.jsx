@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
-import { supabase } from '../../services/supabase';
+import { supabase, storage } from '../../services/supabase';
 import Button from '../../components/common/Button';
 import Loading from '../../components/common/Loading';
+import jsPDF from 'jspdf';
+import 'jspdf-autotable';
 
 const Logs = () => {
   const [isLoading, setIsLoading] = useState(true);
@@ -10,6 +12,8 @@ const Logs = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedLog, setSelectedLog] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isPdfGenerating, setIsPdfGenerating] = useState(false);
+  const [currentTime, setCurrentTime] = useState(new Date());
   
   // Filters
   const [dateFilter, setDateFilter] = useState('all');
@@ -20,6 +24,15 @@ const Logs = () => {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const logsPerPage = 10;
+
+  // Update current time every second to show elapsed time
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    
+    return () => clearInterval(timer);
+  }, []);
 
   // Fetch time logs
   useEffect(() => {
@@ -88,40 +101,196 @@ const Logs = () => {
     fetchLogs();
   }, [dateFilter, startDate, endDate, currentPage]);
 
+  // Generate PDF for a time log
+  const generatePdf = async (log, type = 'punch-in') => {
+    if (!log) return;
+    
+    setIsPdfGenerating(true);
+    
+    try {
+      // Create new PDF document
+      const doc = new jsPDF();
+      const pageWidth = doc.internal.pageSize.getWidth();
+      
+      // Set title and header
+      const title = type === 'punch-in' 
+        ? `Punch-In Report: ${new Date(log.punch_in).toLocaleString()}`
+        : `Punch-Out Report: ${new Date(log.punch_out).toLocaleString()}`;
+      
+      doc.setFontSize(18);
+      doc.text(title, pageWidth / 2, 15, { align: 'center' });
+      
+      // Add driver and vehicle info
+      doc.setFontSize(12);
+      doc.text(`Driver: ${log.drivers?.name || 'Unknown Driver'}`, 20, 30);
+      doc.text(`Email: ${log.drivers?.email || 'Unknown'}`, 20, 38);
+      doc.text(`Vehicle: ${log.vehicles?.vehicle_number || 'Unknown'} - ${log.vehicles ? `${log.vehicles.make} ${log.vehicles.model}` : ''}`, 20, 46);
+      
+      // Add time information
+      doc.text(`Punch In: ${new Date(log.punch_in).toLocaleString()}`, 20, 60);
+      
+      if (log.punch_out) {
+        doc.text(`Punch Out: ${new Date(log.punch_out).toLocaleString()}`, 20, 68);
+        
+        // Calculate duration
+        const punchIn = new Date(log.punch_in);
+        const punchOut = new Date(log.punch_out);
+        const durationMs = punchOut - punchIn;
+        const hours = Math.floor(durationMs / 3600000);
+        const minutes = Math.floor((durationMs % 3600000) / 60000);
+        const seconds = Math.floor((durationMs % 60000) / 1000);
+        
+        doc.text(`Duration: ${hours}h ${minutes}m ${seconds}s`, 20, 76);
+      } else {
+        doc.text(`Status: In Progress`, 20, 68);
+      }
+      
+      // Try to fetch and add images
+      try {
+        // Get folder name based on type
+        const folderPrefix = type === 'punch-in' ? 'PunchIn' : 'PunchOut';
+        const folderPath = `${folderPrefix}-${log.vehicle_id}`;
+        
+        // List files in the folder
+        const { data: files } = await storage.listFiles('vehicle_images', folderPath);
+        
+        if (files && files.length > 0) {
+          doc.addPage();
+          doc.text('Vehicle Inspection Images', pageWidth / 2, 15, { align: 'center' });
+          
+          // Add images to PDF (max 6 images to keep file size manageable)
+          const imagesToInclude = files.slice(0, 6);
+          let yPosition = 30;
+          
+          for (let i = 0; i < imagesToInclude.length; i++) {
+            const file = imagesToInclude[i];
+            const publicUrl = storage.getPublicUrl('vehicle_images', `${folderPath}/${file.name}`);
+            
+            try {
+              // Only add image if we have enough space on the page
+              if (yPosition > 240) {
+                doc.addPage();
+                yPosition = 30;
+              }
+              
+              doc.text(`Image ${i+1}`, 20, yPosition);
+              
+              // Use a placeholder instead of actual image to keep things simple and fast
+              doc.setDrawColor(200);
+              doc.setFillColor(240);
+              doc.rect(20, yPosition + 5, 170, 80, 'FD');
+              doc.setFontSize(10);
+              doc.text(`Vehicle image (${file.name})`, 105, yPosition + 45, { align: 'center' });
+              
+              yPosition += 90;
+            } catch (imgErr) {
+              console.error('Error adding image to PDF:', imgErr);
+            }
+          }
+        }
+      } catch (filesErr) {
+        console.error('Error fetching images for PDF:', filesErr);
+        // Continue without images if there's an error
+      }
+      
+      // Add timestamp and footer
+      const timestamp = new Date().toLocaleString();
+      doc.setFontSize(10);
+      doc.text(`Generated on: ${timestamp}`, 20, doc.internal.pageSize.getHeight() - 10);
+      
+      // Save the PDF
+      doc.save(`${type === 'punch-in' ? 'PunchIn' : 'PunchOut'}_${log.id}.pdf`);
+      
+    } catch (err) {
+      console.error('Error generating PDF:', err);
+      alert('Failed to generate PDF. Please try again.');
+    } finally {
+      setIsPdfGenerating(false);
+    }
+  };
+
   // View log details
   const handleViewLog = async (log) => {
     setSelectedLog(log);
     
     try {
-      // Fetch videos for this log
-      const { data: videos, error } = await supabase
-        .from('videos')
+      // Get both pre and post inspection images
+      const preFolder = `PunchIn-${log.vehicle_id}`;
+      const postFolder = `PunchOut-${log.vehicle_id}`;
+      
+      // Fetch inspection records
+      const { data: inspections, error: inspError } = await supabase
+        .from('vehicle_inspections')
         .select('*')
-        .eq('time_log_id', log.id);
+        .or(`vehicle_id.eq.${log.vehicle_id},time_log_id.eq.${log.id}`);
       
-      if (error) throw error;
+      if (inspError) throw inspError;
       
-      setSelectedLog({ ...log, videos: videos || [] });
+      // Try to get images
+      let images = [];
+      
+      try {
+        // Pre images
+        const { data: preFiles } = await storage.listFiles('vehicle_images', preFolder);
+        if (preFiles && preFiles.length > 0) {
+          const preImages = preFiles.map(file => ({
+            name: file.name,
+            type: 'pre',
+            url: storage.getPublicUrl('vehicle_images', `${preFolder}/${file.name}`)
+          }));
+          images = [...images, ...preImages];
+        }
+        
+        // Post images if log is completed
+        if (log.punch_out) {
+          const { data: postFiles } = await storage.listFiles('vehicle_images', postFolder);
+          if (postFiles && postFiles.length > 0) {
+            const postImages = postFiles.map(file => ({
+              name: file.name,
+              type: 'post',
+              url: storage.getPublicUrl('vehicle_images', `${postFolder}/${file.name}`)
+            }));
+            images = [...images, ...postImages];
+          }
+        }
+      } catch (imgErr) {
+        console.log('Could not fetch images (this is normal if none exist):', imgErr);
+      }
+      
+      // Update selected log with inspection data
+      setSelectedLog({
+        ...log,
+        inspections: inspections || [],
+        inspection_images: images
+      });
+      
       setIsModalOpen(true);
     } catch (err) {
-      console.error('Error fetching videos:', err);
-      // Still open modal but without videos
+      console.error('Error fetching log details:', err);
+      // Still open modal but without images
       setIsModalOpen(true);
     }
   };
 
   // Calculate duration between punch in and punch out
   const calculateDuration = (punchIn, punchOut) => {
-    if (!punchOut) return 'In progress';
-    
     const start = new Date(punchIn);
-    const end = new Date(punchOut);
+    let end;
+    
+    if (punchOut) {
+      end = new Date(punchOut);
+    } else {
+      // For in-progress logs, use current time to show elapsed time
+      end = currentTime;
+    }
+    
     const durationMs = end - start;
     
     const hours = Math.floor(durationMs / 3600000);
     const minutes = Math.floor((durationMs % 3600000) / 60000);
+    const seconds = Math.floor((durationMs % 60000) / 1000);
     
-    return `${hours}h ${minutes}m`;
+    return `${hours}h ${minutes}m ${seconds}s`;
   };
 
   // Format date
@@ -130,10 +299,15 @@ const Logs = () => {
     return date.toLocaleDateString();
   };
 
-  // Format time
+  // Format time as HH:MM:SS
   const formatTime = (dateString) => {
     const date = new Date(dateString);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString('en-US', { 
+      hour: '2-digit', 
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true  // Set to false if you want 24-hour format
+    });
   };
 
   // Filter logs by search term
@@ -352,7 +526,7 @@ const Logs = () => {
                         </>
                       ) : (
                         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-                          In Progress
+                          {calculateDuration(log.punch_in, null)}
                         </span>
                       )}
                     </td>
@@ -491,7 +665,7 @@ const Logs = () => {
                     </p>
                   ) : (
                     <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-                      In Progress
+                      {calculateDuration(selectedLog.punch_in, null)}
                     </span>
                   )}
                 </div>
@@ -504,37 +678,65 @@ const Logs = () => {
                 </div>
               </div>
               
+              {/* Vehicle Images */}
               <div className="border-t pt-4">
-                <h4 className="text-sm font-medium text-gray-700 mb-3">Vehicle Videos</h4>
+                <h4 className="text-sm font-medium text-gray-700 mb-3">Vehicle Images</h4>
                 
-                {selectedLog.videos && selectedLog.videos.length > 0 ? (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {selectedLog.videos.map((video) => (
-                      <div key={video.id} className="border rounded-lg overflow-hidden">
-                        <div className="bg-gray-100 p-2 border-b">
-                          <span className="text-sm font-medium">
-                            {video.type === 'pre' ? 'Before Task' : 'After Task'} Video
-                          </span>
-                        </div>
-                        <div className="p-3">
-                          <p className="text-sm text-gray-500 mb-2">
-                            Recorded on {new Date(video.created_at).toLocaleString()}
-                          </p>
-                          <a 
-                            href={video.video_url} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center px-3 py-2 border border-blue-300 text-sm leading-4 font-medium rounded-md text-blue-700 bg-blue-50 hover:bg-blue-100"
-                          >
-                            <i className="ri-video-line mr-1"></i> View Video
-                          </a>
+                {selectedLog.inspection_images && selectedLog.inspection_images.length > 0 ? (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                    {selectedLog.inspection_images.map((image, index) => (
+                      <div key={index} className="relative border rounded-lg overflow-hidden">
+                        <img 
+                          src={image.url} 
+                          alt={`Inspection ${index + 1}`} 
+                          className="w-full h-32 object-cover"
+                        />
+                        <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs p-1">
+                          {image.type === 'pre' ? 'Before Task' : 'After Task'}
                         </div>
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <p className="text-sm text-gray-500">No videos available for this time log.</p>
+                  <p className="text-sm text-gray-500">No images available for this time log.</p>
                 )}
+                
+                {/* PDF Download Buttons */}
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    onClick={() => generatePdf(selectedLog, 'punch-in')}
+                    disabled={isPdfGenerating}
+                    className="px-3 py-2 bg-blue-500 text-white rounded flex items-center text-sm hover:bg-blue-600 disabled:opacity-50"
+                  >
+                    {isPdfGenerating ? (
+                      <>
+                        <i className="ri-loader-2-line animate-spin mr-1"></i> Generating...
+                      </>
+                    ) : (
+                      <>
+                        <i className="ri-file-pdf-line mr-1"></i> Download Punch-In PDF
+                      </>
+                    )}
+                  </button>
+                  
+                  {selectedLog.punch_out && (
+                    <button
+                      onClick={() => generatePdf(selectedLog, 'punch-out')}
+                      disabled={isPdfGenerating}
+                      className="px-3 py-2 bg-green-500 text-white rounded flex items-center text-sm hover:bg-green-600 disabled:opacity-50"
+                    >
+                      {isPdfGenerating ? (
+                        <>
+                          <i className="ri-loader-2-line animate-spin mr-1"></i> Generating...
+                        </>
+                      ) : (
+                        <>
+                          <i className="ri-file-pdf-line mr-1"></i> Download Punch-Out PDF
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
             

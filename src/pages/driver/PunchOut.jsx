@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { supabase, timeLogs, vehicles } from '../../services/supabase';
+import { useState, useEffect } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { supabase, timeLogs, vehicles, storage, pdfService } from '../../services/supabase';
 import useAuthStore from '../../store/authStore';
 import Button from '../../components/common/Button';
 import Loading from '../../components/common/Loading';
+import ImageCapture from '../../components/driver/ImageCapture';
 
 const PunchOut = () => {
   const navigate = useNavigate();
@@ -13,14 +14,10 @@ const PunchOut = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isPunching, setIsPunching] = useState(false);
-  const [videoUploaded, setVideoUploaded] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const [imagesUploaded, setImagesUploaded] = useState(false);
+  const [uploadingImages, setUploadingImages] = useState(false);
   const [workDuration, setWorkDuration] = useState('');
-  const [stream, setStream] = useState(null);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
-  const videoRef = useRef(null);
+  const [pdfUrl, setPdfUrl] = useState(null);
   
   // Fetch active time log
   useEffect(() => {
@@ -95,8 +92,8 @@ const PunchOut = () => {
 
   // Handle punch out
   const handlePunchOut = async () => {
-    if (!videoUploaded) {
-      document.getElementById('videoModal').classList.remove('hidden');
+    if (!imagesUploaded) {
+      document.getElementById('imageModal').classList.remove('hidden');
       return;
     }
     
@@ -114,6 +111,12 @@ const PunchOut = () => {
       // Update vehicle status back to available
       await vehicles.updateStatus(activeLog.vehicle_id, 'available', null);
       
+      // Generate PDF report
+      if (pdfUrl) {
+        // PDF was already generated during image upload
+        console.log('Using already generated PDF:', pdfUrl);
+      }
+      
       // Show success message and redirect to home
       setTimeout(() => {
         navigate('/driver');
@@ -125,116 +128,100 @@ const PunchOut = () => {
     }
   };
 
-  // Request camera access and start recording
-  const startVideoRecording = async () => {
+  // Handle image capture completion and upload
+  const handleImageCaptureComplete = async (imageData) => {
+    if (!activeLog || !user) return;
+    
     try {
-      // Request camera access
-      const mediaStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment' }, 
-        audio: true 
+      setUploadingImages(true);
+      
+      // Create folder name for storage
+      const folderName = `PunchOut-${activeLog.vehicle_id}-${activeLog.id}`;
+      const bucketName = 'vehicle_images';
+      
+      // Loop through each image and upload it
+      const uploadPromises = imageData.images.map(async (imageDataUrl, index) => {
+        try {
+          // Convert the data URL to a Blob
+          const response = await fetch(imageDataUrl);
+          const blob = await response.blob();
+          
+          // Prepare the file name
+          const imageFileName = `${folderName}/image-${index + 1}-${Date.now()}.jpg`;
+          
+          // Upload to Supabase storage
+          const { data, error } = await storage.uploadImage(bucketName, imageFileName, blob);
+          
+          if (error) {
+            console.error(`Error uploading image ${index + 1}:`, error);
+            throw error;
+          }
+          
+          return data;
+        } catch (err) {
+          console.error(`Error processing image ${index + 1}:`, err);
+          throw err;
+        }
       });
       
-      // Set video source
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        videoRef.current.play();
+      // Update progress during uploads
+      let completedUploads = 0;
+      const totalUploads = imageData.images.length;
+      
+      // Process uploads one by one to track progress
+      for (const uploadPromise of uploadPromises) {
+        await uploadPromise;
+        completedUploads++;
+        const progress = Math.round((completedUploads / totalUploads) * 100);
+        imageData.uploadProgress(progress);
       }
       
-      // Create media recorder
-      const recorder = new MediaRecorder(mediaStream, { mimeType: 'video/webm' });
-      setMediaRecorder(recorder);
-      setStream(mediaStream);
-      
-      const chunks = [];
-      
-      // Listen for data
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          chunks.push(e.data);
-        }
+      // Create a record of the inspection with PDF generation
+      const inspectionRecord = {
+        driver_id: user.id,
+        vehicle_id: activeLog.vehicle_id,
+        time_log_id: activeLog.id,
+        inspection_type: 'post',
+        image_count: imageData.images.length,
+        images_folder: folderName,
+        timestamp: new Date().toISOString(),
       };
       
-      // Handle recording complete
-      recorder.onstop = async () => {
-        // Create a video blob
-        const blob = new Blob(chunks, { type: 'video/webm' });
+      const { data: inspectionData, error: recordError } = await supabase
+        .from('vehicle_inspections')
+        .insert([inspectionRecord])
+        .select();
+      
+      if (recordError) throw recordError;
+      
+      // Generate PDF for the inspection
+      const { success, pdfUrl: generatedPdfUrl, data: pdfData } = await pdfService.generateInspectionPdf(
+        activeLog.id,
+        activeLog.vehicle_id,
+        imageData.images,
+        imageData.timestamp
+      );
+      
+      if (success && generatedPdfUrl) {
+        setPdfUrl(generatedPdfUrl);
         
-        try {
-          // Upload to Supabase storage
-          const videoFileName = `vehicle-${activeLog.vehicle_id}-post-${Date.now()}.webm`;
-          
-          // Upload with progress tracking
-          const { error } = await supabase.storage
-            .from('videos')
-            .upload(videoFileName, blob, {
-              onUploadProgress: (progress) => {
-                const percentage = Math.round((progress.loaded / progress.total) * 100);
-                setUploadProgress(percentage);
-              }
-            });
-          
-          if (error) throw error;
-          
-          // Get public URL
-          const { data: { publicUrl } } = supabase.storage
-            .from('videos')
-            .getPublicUrl(videoFileName);
-          
-          // Create video record
-          const { error: recordError } = await supabase
-            .from('videos')
-            .insert([{
-              driver_id: user.id,
-              vehicle_id: activeLog.vehicle_id,
-              time_log_id: activeLog.id,
-              type: 'post',
-              video_url: publicUrl,
-            }]);
-          
-          if (recordError) throw recordError;
-          
-          setVideoUploaded(true);
-        } catch (err) {
-          console.error('Error uploading video:', err);
-          alert('Failed to upload video. Please try again.');
-          setUploadProgress(0);
-        }
-      };
+        // Update the inspection record with PDF URL
+        await supabase
+          .from('vehicle_inspections')
+          .update({ pdf_url: generatedPdfUrl })
+          .eq('id', inspectionData[0].id);
+      }
       
-      // Start recording
-      recorder.start();
-      setIsRecording(true);
-      
-      // Set time limit (15 seconds)
-      const timerId = setInterval(() => {
-        setRecordingTime((prev) => {
-          if (prev >= 15) {
-            clearInterval(timerId);
-            stopRecording();
-            return 15;
-          }
-          return prev + 1;
-        });
-      }, 1000);
+      // Mark as uploaded
+      setImagesUploaded(true);
+      document.getElementById('imageModal').classList.add('hidden');
       
     } catch (err) {
-      console.error('Error accessing camera:', err);
-      alert('Failed to access camera. Please check your device permissions.');
+      console.error('Error details:', err);
+      alert('Failed to upload images. Please check your connection and try again.');
+    } finally {
+      setUploadingImages(false);
     }
-  };
-
-  // Stop recording
-  const stopRecording = () => {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.stop();
-    }
-    
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop());
-    }
-    
-    setIsRecording(false);
-    setRecordingTime(0);
   };
 
   if (isLoading) {
@@ -293,11 +280,20 @@ const PunchOut = () => {
               </div>
               
               <div className="flex justify-between">
-                <span className="text-gray-600">Video Check:</span>
-                <span className={`font-medium ${videoUploaded ? 'text-success' : 'text-yellow-600'}`}>
-                  {videoUploaded ? 'Completed' : 'Required'}
+                <span className="text-gray-600">Photos:</span>
+                <span className={`font-medium ${imagesUploaded ? 'text-success' : 'text-yellow-600'}`}>
+                  {imagesUploaded ? 'Uploaded' : 'Required'}
                 </span>
               </div>
+              
+              {pdfUrl && (
+                <div className="flex justify-between mt-2">
+                  <span className="text-gray-600">Inspection Report:</span>
+                  <Link to={`/pdf/${pdfUrl.split('/').pop()}`} className="text-primary hover:underline">
+                    View PDF
+                  </Link>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -326,7 +322,7 @@ const PunchOut = () => {
                 Before punching out, please:
               </p>
               <ul className="list-disc pl-5 mt-2 space-y-1 text-sm text-gray-600">
-                <li>Record a final 15-second video of the vehicle condition.</li>
+                <li>Take photos of the vehicle condition (front, sides, rear).</li>
                 <li>Make sure the vehicle is parked safely and properly.</li>
                 <li>Report any issues or incidents that occurred during usage.</li>
               </ul>
@@ -334,17 +330,17 @@ const PunchOut = () => {
             
             <Button
               isFullWidth
-              variant={videoUploaded ? "primary" : "outline"}
+              variant={imagesUploaded ? "primary" : "outline"}
               size="lg"
               isLoading={isPunching}
               onClick={handlePunchOut}
               icon={<i className="ri-logout-box-line"></i>}
-              disabled={!videoUploaded && isPunching}
+              disabled={!imagesUploaded && isPunching}
             >
-              {videoUploaded ? "Punch Out Now" : "Record Video & Punch Out"}
+              {imagesUploaded ? "Punch Out Now" : "Take Photos & Punch Out"}
             </Button>
             
-            {isPunching && videoUploaded && (
+            {isPunching && imagesUploaded && (
               <div className="mt-4 text-center text-sm text-success">
                 <i className="ri-check-line"></i> Successfully punched out. Redirecting...
               </div>
@@ -353,14 +349,14 @@ const PunchOut = () => {
         </div>
       </div>
       
-      {/* Video Recording Modal */}
-      <div id="videoModal" className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 hidden">
+      {/* Image Capture Modal */}
+      <div id="imageModal" className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 hidden">
         <div className="bg-white rounded-lg shadow-xl w-full max-w-lg overflow-hidden">
           <div className="px-6 py-4 border-b flex justify-between items-center">
-            <h3 className="font-semibold text-lg">Record Final Vehicle Inspection</h3>
-            {!isRecording && !videoUploaded && uploadProgress === 0 && (
+            <h3 className="font-semibold text-lg">Final Vehicle Inspection</h3>
+            {!imagesUploaded && !uploadingImages && (
               <button 
-                onClick={() => document.getElementById('videoModal').classList.add('hidden')}
+                onClick={() => document.getElementById('imageModal').classList.add('hidden')}
                 className="text-gray-500 hover:text-gray-700"
               >
                 <i className="ri-close-line text-2xl"></i>
@@ -369,111 +365,12 @@ const PunchOut = () => {
           </div>
           
           <div className="p-6">
-            {!videoUploaded ? (
-              <>
-                <div className="bg-black rounded-md overflow-hidden aspect-video mb-4">
-                  <video
-                    ref={videoRef}
-                    className="w-full h-full object-cover"
-                    autoPlay
-                    playsInline
-                    muted
-                  ></video>
-                </div>
-                
-                {isRecording ? (
-                  <div className="text-center mb-4">
-                    <div className="text-2xl font-bold text-red-600 mb-2">
-                      Recording... {recordingTime}/15s
-                    </div>
-                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-red-600 transition-all duration-1000"
-                        style={{ width: `${(recordingTime / 15) * 100}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ) : uploadProgress > 0 && uploadProgress < 100 ? (
-                  <div className="text-center mb-4">
-                    <div className="text-xl font-bold text-primary mb-2">
-                      Uploading... {uploadProgress}%
-                    </div>
-                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-primary transition-all duration-300"
-                        style={{ width: `${uploadProgress}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ) : uploadProgress === 100 ? (
-                  <div className="text-center mb-4">
-                    <div className="text-xl font-bold text-success mb-2">
-                      Upload Complete!
-                    </div>
-                    <p className="text-gray-600">Your video has been uploaded successfully.</p>
-                  </div>
-                ) : (
-                  <div className="text-center mb-4">
-                    <p className="text-gray-600 mb-2">
-                      Record a 15-second video showing the vehicle's final condition.
-                    </p>
-                    <p className="text-sm text-gray-500">
-                      Walk around the vehicle and capture its current state.
-                    </p>
-                  </div>
-                )}
-                
-                <div className="flex justify-center">
-                  {!isRecording && uploadProgress === 0 ? (
-                    <Button
-                      variant="primary"
-                      onClick={startVideoRecording}
-                      icon={<i className="ri-record-circle-line"></i>}
-                    >
-                      Start Recording
-                    </Button>
-                  ) : isRecording ? (
-                    <Button
-                      variant="danger"
-                      onClick={stopRecording}
-                      icon={<i className="ri-stop-circle-line"></i>}
-                    >
-                      Stop Recording
-                    </Button>
-                  ) : uploadProgress === 100 ? (
-                    <Button
-                      variant="success"
-                      onClick={() => {
-                        document.getElementById('videoModal').classList.add('hidden');
-                        setVideoUploaded(true);
-                      }}
-                    >
-                      Continue to Punch Out
-                    </Button>
-                  ) : null}
-                </div>
-              </>
-            ) : (
-              <div className="text-center py-4">
-                <div className="text-5xl text-success mb-4">
-                  <i className="ri-check-line"></i>
-                </div>
-                <h4 className="text-xl font-bold text-gray-800 mb-2">Video Uploaded Successfully</h4>
-                <p className="text-gray-600">
-                  Your final vehicle inspection video has been recorded and saved.
-                </p>
-                <Button
-                  variant="primary"
-                  className="mt-4"
-                  onClick={() => {
-                    document.getElementById('videoModal').classList.add('hidden');
-                    handlePunchOut();
-                  }}
-                >
-                  Continue to Punch Out
-                </Button>
-              </div>
-            )}
+            <ImageCapture
+              maxImages={6}
+              title="Final Vehicle Inspection"
+              instructions="Take photos of the vehicle from different angles (front, sides, rear, interior) and any damage."
+              onCaptureComplete={handleImageCaptureComplete}
+            />
           </div>
         </div>
       </div>
